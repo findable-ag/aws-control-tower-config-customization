@@ -4,14 +4,14 @@ Parameters:
 
   ExcludedAccounts:
     Description: Excluded Accounts list. This list should contain Management account, Log Archive and Audit accounts at the minimum
-    Default: "['111111111111', '222222222222', '333333333333']"
+    Default: "['305497534492', '313101040085', '627614371000']"
     MaxLength: '2000'
     MinLength: '36'
     Type: String
 
   ConfigRecorderResourceTypes:
-    Description: List of all Config Recorder resource types to enable recording on 
-    Default: "AWS::ApiGateway::RestApi,AWS::ApiGateway::Stage,AWS::ApiGatewayV2::Api,AWS::ApiGatewayV2::Stage,AWS::Backup::BackupPlan,AWS::Backup::BackupSelection,AWS::Backup::BackupVault,AWS::Backup::RecoveryPoint,AWS::CloudFormation::Stack,AWS::CloudFront::Distribution,AWS::CloudTrail::Trail,AWS::CloudWatch::Alarm,AWS::CodeBuild::Project,AWS::CodeDeploy::Application,AWS::CodeDeploy::DeploymentConfig,AWS::CodePipeline::Pipeline,AWS::Config::ResourceCompliance,AWS::DynamoDB::Table,AWS::EC2::EIP,AWS::EC2::Instance,AWS::EC2::InternetGateway,AWS::EC2::NetworkAcl,AWS::EC2::NetworkInterface,AWS::EC2::RouteTable,AWS::EC2::SecurityGroup,AWS::EC2::Subnet,AWS::EC2::VPC,AWS::EC2::VPCEndpoint,AWS::EC2::Volume,AWS::ElasticBeanstalk::Application,AWS::ElasticBeanstalk::ApplicationVersion,AWS::ElasticBeanstalk::Environment,AWS::IAM::Policy,AWS::IAM::Role,AWS::IAM::User,AWS::KMS::Key,AWS::Lambda::Function,AWS::RDS::DBSecurityGroup,AWS::RDS::DBSnapshot,AWS::RDS::DBSubnetGroup,AWS::Redshift::ClusterParameterGroup,AWS::S3::AccountPublicAccessBlock,AWS::S3::Bucket,AWS::SNS::Topic,AWS::SQS::Queue,AWS::SSM::ManagedInstanceInventory,AWS::WAFv2::WebACL"
+    Description: List of all Config Recorder resource types to disable recording on
+    Default: "AWS::EC2::EIP,AWS::EC2::Instance,AWS::EC2::InternetGateway,AWS::EC2::NetworkAcl,AWS::EC2::NetworkInterface,AWS::EC2::RouteTable,AWS::EC2::SecurityGroup,AWS::EC2::Subnet,AWS::EC2::VPC,AWS::EC2::VPCEndpoint,AWS::EC2::Volume,AWS::ECS::Service,AWS::ECS::TaskDefinition,AWS::ECS::TaskSet"
     Type: String
 
   CloudFormationVersion:
@@ -45,7 +45,7 @@ Resources:
             ReservedConcurrentExecutions: 1
             Environment:
                 Variables:
-                    EXCLUDED_ACCOUNTS: !Ref ExcludedAccounts #['432177588334', '432177588334', '251383938081' ]
+                    EXCLUDED_ACCOUNTS: !Ref ExcludedAccounts
                     LOG_LEVEL: INFO
                     SQS_URL: !Ref SQSConfigRecorder
 
@@ -64,9 +64,120 @@ Resources:
         Properties:
             #FunctionName: ct_configrecorder_override_consumer_cf
             Code:
-                S3Bucket: !Ref LambdaZipsBucket
-                S3Key: ct-blogs-content/ct_configrecorder_override_consumer.zip
-            Handler: ct_configrecorder_override_consumer.lambda_handler
+                ZipFile: |
+                  import boto3
+                  import json
+                  import os
+                  import logging
+
+                  def lambda_handler(event, context):
+
+                      LOG_LEVEL = os.getenv('LOG_LEVEL')
+                      logging.getLogger().setLevel(LOG_LEVEL)
+
+                      try:
+
+                          logging.info('Event Data:')
+                          logging.info(event)
+
+                          body = json.loads(event['Records'][0]['body'])
+                          account_id = body['Account']
+                          aws_region = body['Region']
+                          event = body['Event']
+
+                          logging.info(f'Extracted Account: {account_id}')
+                          logging.info(f'Extracted Region: {aws_region}')
+                          logging.info(f'Extracted Event: {event}')
+
+                          STS = boto3.client("sts")
+
+                          def assume_role(account_id, role='AWSControlTowerExecution'):
+                              '''
+                              Return a session in the target account using Control Tower Role
+                              '''
+                              try:
+                                  curr_account = STS.get_caller_identity()['Account']
+                                  if curr_account != account_id:
+                                      part = STS.get_caller_identity()['Arn'].split(":")[1]
+
+                                      role_arn = 'arn:' + part + ':iam::' + account_id + ':role/' + role
+                                      ses_name = str(account_id + '-' + role)
+                                      response = STS.assume_role(RoleArn=role_arn, RoleSessionName=ses_name)
+                                      sts_session = boto3.Session(
+                                          aws_access_key_id=response['Credentials']['AccessKeyId'],
+                                          aws_secret_access_key=response['Credentials']['SecretAccessKey'],
+                                          aws_session_token=response['Credentials']['SessionToken']   )
+
+                                      return sts_session
+                              except ClientError as exe:
+                                  logging.error('Unable to assume role')
+                                  raise exe
+
+
+                          sts_session = assume_role(account_id)
+                          logging.info(f'Printing STS session: {sts_session}')
+
+                          #Lets use the session and create a client for configservice
+                          configservice = sts_session.client('config',region_name=aws_region)
+
+                          #lets describe for configguration recorder
+                          configrecorder = configservice.describe_configuration_recorders()
+                          logging.info(f'Existing Configuration Recorder :' ,configrecorder)
+
+                          #ControlTower created configuration recorder with name "aws-controltower-BaselineConfigRecorder" and we will update just that
+                          try:
+                              role_arn = 'arn:aws:iam::' + account_id + ':role/aws-controltower-ConfigRecorderRole'
+                              CONFIG_RECORDER_RESOURCE_STRING = os.getenv('CONFIG_RECORDER_RESOURCE_LIST')
+                              CONFIG_RECORDER_RESOURCE_LIST = CONFIG_RECORDER_RESOURCE_STRING.split(',')
+
+                              # Event = Delete is when stack is deleted, we rollback changed made and leave it as ControlTower Intended
+                              if event == 'Delete':
+                                  response = configservice.put_configuration_recorder(
+                                  ConfigurationRecorder={
+                                      'name': 'aws-controltower-BaselineConfigRecorder',
+                                      'roleARN': role_arn,
+                                      'recordingGroup': {
+                                          'allSupported': True,
+                                          'includeGlobalResourceTypes': False
+                                      }
+                                  })
+                              else:
+                                  response = configservice.put_configuration_recorder(
+                                  ConfigurationRecorder={
+                                      'name': 'aws-controltower-BaselineConfigRecorder',
+                                      'roleARN': role_arn,
+                                      'recordingGroup': {
+                                          "allSupported": False,
+                                          "exclusionByResourceTypes": {
+                                              "resourceTypes": CONFIG_RECORDER_RESOURCE_LIST
+                                          },
+                                          "includeGlobalResourceTypes": False,
+                                          "recordingStrategy": {
+                                              "useOnly": "EXCLUSION_BY_RESOURCE_TYPES"
+                                          },
+                                      }
+                                  })
+                              logging.info(f'Response for put_configuration_recorder :{response} ')
+
+                              #lets describe for configuration recorder after the update
+                              configrecorder =  configservice.describe_configuration_recorders()
+                              logging.info(f'Post Change Configuration recorder : {configrecorder}')
+
+                          except:
+                              logging.error('Unable to Update Config Recorder for Account and Region : ', account_id, aws_region)
+                              configrecorder =  configservice.describe_configuration_recorders()
+                              logging.info(f'Exception : {configrecorder}')
+                              raise exe
+
+                          return {
+                              'statusCode': 200
+                          }
+
+                      except Exception as e:
+                          exception_type = e.__class__.__name__
+                          exception_message = str(e)
+                          logging.exception(f'{exception_type}: {exception_message}')
+            Handler: index.lambda_handler
             Role: !GetAtt ConsumerLambdaExecutionRole.Arn
             Runtime: python3.9
             MemorySize: 128
@@ -175,7 +286,7 @@ Resources:
                             "eventName": ["UpdateLandingZone", "CreateManagedAccount", "UpdateManagedAccount"]
                           }
                         }'
-          Name: !GetAtt SQSConfigRecorder.QueueName #ct_configrecorder_override_cf
+          Name: ct_config_recorder_override
           State: ENABLED
           Targets: 
             - 
